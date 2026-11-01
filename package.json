@@ -1,0 +1,33 @@
+{
+  "name": "dsh-voice-alerts",
+  "version": "0.2.0",
+  "description": "Offline Windows voice notifications for DeepSeek Harness agent events",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Cosine16/dsh-voice-alerts.git"
+  },
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "lib",
+    "audio",
+    "scripts",
+    "test",
+    "settings.json",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.5 <0.2.2"
+  },
+  "scripts": {
+    "test": "node --test",
+    "pack": "npm pack"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

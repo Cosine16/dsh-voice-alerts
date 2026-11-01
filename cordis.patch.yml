@@ -1,0 +1,3 @@
+- insert:
+    - id: voice-alerts
+      name: dsh-voice-alerts

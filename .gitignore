@@ -1,0 +1,13 @@
+# Installed Harness implementation copied only for local compatibility inspection.
+.compat/
+
+# Dependencies, caches, generated distribution archives and local overrides.
+node_modules/
+.npm-cache*/
+*.tgz
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

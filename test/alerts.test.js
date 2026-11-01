@@ -1,0 +1,123 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
+import { approvalKind, failureKind, validateConfig } from '../lib/config.js';
+import { createQueue } from '../lib/queue.js';
+import { registerEvents } from '../lib/events.js';
+
+const defaults = JSON.parse(readFileSync(new URL('../settings.json', import.meta.url)));
+function fixture(options = {}) {
+  const handlers = new Map(), cleanup = [], spoken = [];
+  const ctx = { on(event, listener) { handlers.set(event, listener); }, effect(fn) { cleanup.push(fn()); } };
+  const config = { ...defaults, approvalDelayMs: 5, errorCoalesceMs: 5, ...options };
+  registerEvents(ctx, { enqueue(...args) { if (config.events[args[0]]) spoken.push(args); }, dispose() { spoken.push(['disposed']); } }, config);
+  return { emit: (event, ...args) => handlers.get(event)(...args), spoken, dispose() { cleanup.forEach(fn => fn()); } };
+}
+test('approval classification distinguishes sensitive, admin, and plain sandbox widening', () => {
+  assert.equal(approvalKind({ reason: 'sudo install the package' }), 'privilege');
+  assert.equal(approvalKind({ reason: '需要管理员终端' }), 'privilege');
+  assert.equal(approvalKind({ reason: 'Read sensitive credentials' }), 'sensitive');
+  assert.equal(approvalKind({ reason: 'escalate sandbox to danger-full-access: download package' }), 'authorization');
+  assert.equal(failureKind({ code: 'TRANSPORT' }), 'connectionLost');
+  assert.equal(failureKind({ code: 'HTTP_401' }), 'authenticationFailed');
+  assert.equal(failureKind({ code: 'TIMEOUT' }), 'requestTimeout');
+  assert.equal(failureKind({ status: 429 }), 'rateLimited');
+  assert.equal(failureKind({ code: 'HTTP_403' }), 'error');
+});
+test('configuration rejects invalid volume and event switches', () => {
+  assert.throws(() => validateConfig({ ...defaults, volume: 101 }), /volume/);
+  assert.throws(() => validateConfig({ ...defaults, events: {} }), /events/);
+});
+test('pending approvals delegate immediately and preserve answer, suppress quick responses', async () => {
+  const f = fixture();
+  let resolve, called = false;
+  const answer = new Promise(r => { resolve = r; });
+  const result = f.emit('approval/request', { reason: 'sudo needed' }, () => { called = true; return answer; });
+  assert.equal(called, true);
+  await delay(15);
+  assert.equal(f.spoken[0][0], 'privilege');
+  assert.equal(f.spoken[0][2](), true);
+  resolve('rejected');
+  assert.equal(await result, 'rejected');
+  assert.equal(f.spoken[0][2](), false);
+  f.spoken.length = 0;
+  assert.equal(await f.emit('approval/request', {}, () => 'allowed-once'), 'allowed-once');
+  await delay(15);
+  assert.equal(f.spoken.length, 0);
+  f.dispose();
+});
+test('abort, errors, and disposal preserve approval behavior and stop stale audio', async () => {
+  const f = fixture();
+  const controller = new AbortController();
+  let finish;
+  const promise = f.emit('approval/request', { signal: controller.signal }, () => new Promise(r => { finish = r; }));
+  controller.abort();
+  await delay(15);
+  assert.equal(f.spoken[0][2](), false);
+  finish('cancelled'); await promise;
+  const error = new Error('answerer failed');
+  assert.throws(() => f.emit('approval/request', {}, () => { throw error; }), error);
+  await assert.rejects(f.emit('approval/request', {}, () => Promise.reject(error)), error);
+  f.dispose();
+});
+test('completion distinguishes cancellation, limits, blocks and ordinary forks', () => {
+  const f = fixture();
+  const session = { id: 'main', header: {} };
+  for (const reason of [{kind:'aborted', reason:{kind:'user'}}, {kind:'max-tokens'}, {kind:'blocked'}, {kind:'interrupted'}]) f.emit('session/event', session, { type: 'turn/end', data: { reason } });
+  f.emit('session/event', { id: 'child', header: { origin: 'subagent' } }, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+  assert.deepEqual(f.spoken.map(x => x[0]), ['tokenLimit', 'taskBlocked']);
+  f.spoken.length = 0;
+  f.emit('session/event', { id: 'fork', header: { parentSession: 'old' } }, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+  assert.equal(f.spoken[0][0], 'taskComplete');
+  f.emit('subagent/end', { id: 'child', stopReason: 'aborted' });
+  assert.equal(f.spoken.length, 1);
+  f.emit('subagent/end', { id: 'child', stopReason: 'completed' });
+  assert.equal(f.spoken[1][0], 'subagentComplete');
+  f.dispose();
+});
+test('connection failure preserves retry and does not double-announce terminal error', async () => {
+  const f = fixture(), agent = { session: { id: 'main', header: {} } };
+  const retry = { kind: 'retry' };
+  assert.equal(await f.emit('agent/request-error', { agent, failure: { code: 'TRANSPORT' } }, () => retry), retry);
+  f.emit('agent/error', { agent, error: new Error('failed') });
+  assert.equal(f.spoken.length, 1);
+  assert.equal(f.spoken[0][0], 'connectionLost');
+  f.emit('session/event', agent.session, { type: 'turn/start', data: {turn:2} });
+  f.emit('agent/error', { agent, error: new Error('new failure') });
+  await delay(15);
+  assert.equal(f.spoken[1][0], 'error');
+  f.dispose();
+});
+test('queue serializes, deduplicates and prioritizes pending approval over completions', async () => {
+  const played = [], resolvers = [];
+  const q = createQueue(defaults, kind => { played.push(kind); return { done: new Promise(r => resolvers.push(r)), cancel() {} }; }, assert.fail);
+  q.enqueue('taskComplete', 'a'); q.enqueue('taskComplete', 'a');
+  q.enqueue('subagentComplete', 'b'); q.enqueue('privilege', 'c');
+  assert.deepEqual(played, ['taskComplete']);
+  resolvers.shift()(); await delay(0);
+  assert.deepEqual(played, ['taskComplete', 'privilege']);
+  resolvers.shift()(); await delay(0);
+  assert.deepEqual(played, ['taskComplete', 'privilege', 'subagentComplete']);
+  resolvers.shift()(); await delay(0); q.dispose();
+});
+test('queue bounds pending work, skips withdrawn alerts, contains playback failure and cancels on unload', async () => {
+  const played = [], warned = [], resolvers = [];
+  let cancelCount = 0, time = 1000;
+  const q = createQueue({ ...defaults, maxQueue: 1 }, kind => { played.push(kind); return { done: new Promise((resolve, reject) => resolvers.push({ resolve, reject })), cancel() { cancelCount++; } }; }, error => warned.push(error), () => time);
+  q.enqueue('taskComplete', '1');
+  q.enqueue('subagentComplete', '2');
+  q.enqueue('subagentComplete', '3');
+  let valid = true;
+  q.enqueue('privilege', '4', () => valid);
+  valid = false;
+  resolvers.shift().reject(new Error('audio device unavailable')); await delay(0);
+  assert.equal(warned.length, 1);
+  assert.deepEqual(played, ['taskComplete']);
+  q.enqueue('error'); assert.equal(played.length, 1);
+  time += defaults.playbackFailureCooldownMs;
+  q.enqueue('error'); q.dispose(); q.enqueue('taskComplete', '5');
+  assert.equal(cancelCount, 1);
+  assert.deepEqual(played, ['taskComplete', 'error']);
+  resolvers.shift().resolve(); await delay(0);
+});
